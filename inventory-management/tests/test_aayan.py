@@ -98,3 +98,23 @@ def test_product_not_found_error_cases(client):
     assert client.put("/products/999", json={"name": "Ghost"}).status_code == 404
     assert client.delete("/products/999").status_code == 404
     assert client.get("/products/999/stock-level").status_code == 404
+
+# =====================================================================
+# Commit 2: Low-Stock Thresholds & Boundary Conditions
+# =====================================================================
+
+def test_low_stock_identifies_items_at_or_below_reorder_level(client):
+    """Verify GET /products/low-stock checks boundary conditions (below, equal, above threshold)."""
+    # Below threshold (3 < 10) -> should be flagged
+    client.post("/products", json={"name": "Below", "sku": "B-1", "quantity_on_hand": 3, "reorder_level": 10})
+    # Exactly at threshold (10 == 10) -> should be flagged per R10
+    client.post("/products", json={"name": "Equal", "sku": "E-1", "quantity_on_hand": 10, "reorder_level": 10})
+    # Above threshold (11 > 10) -> should NOT be flagged
+    client.post("/products", json={"name": "Above", "sku": "A-1", "quantity_on_hand": 11, "reorder_level": 10})
+
+    resp = client.get("/products/low-stock")
+    assert resp.status_code == 200
+    flagged_skus = [p["sku"] for p in resp.get_json()]
+    assert "B-1" in flagged_skus
+    assert "E-1" in flagged_skus
+    assert "A-1" not in flagged_skus
