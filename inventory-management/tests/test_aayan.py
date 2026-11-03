@@ -175,3 +175,85 @@ def test_filter_transactions_by_product_id_returns_matching_records(client):
     results = resp.get_json()
     assert len(results) == 1
     assert results[0]["product_id"] == 1
+
+# =====================================================================
+# Commit 4: Functional Enhancement Tests (Search/Filter, Metadata, Reconcile)
+# =====================================================================
+
+def test_product_metadata_and_location_tags_validation(client):
+    """Verify creating/updating a product with category, unit_of_measure, and max 3 location tags (R2, R7)."""
+    resp = client.post("/products", json={
+        "name": "Steel Pipe",
+        "sku": "SP-10",
+        "category": "Plumbing",
+        "unit_of_measure": "meters",
+        "locations": ["Warehouse A", "Aisle 3", "Bin 12"]
+    })
+    assert resp.status_code == 201
+    prod = resp.get_json()
+    assert prod["category"] == "Plumbing"
+    assert prod["unit_of_measure"] == "meters"
+    assert prod["locations"] == ["Warehouse A", "Aisle 3", "Bin 12"]
+
+    # Exceeding 3 location tags must fail with 400 Bad Request
+    bad_resp = client.post("/products", json={
+        "name": "Extra Pipe",
+        "sku": "SP-11",
+        "locations": ["W1", "A1", "B1", "ExtraTag"]
+    })
+    assert bad_resp.status_code == 400
+
+
+def test_search_and_filter_products_by_name_sku_category_and_supplier(client):
+    """Verify GET /products query parameters filter by partial string matches (R21)."""
+    client.post("/suppliers", json={"name": "Acme Hardware", "contact_email": "acme@test.com"})
+    client.post("/products", json={"name": "Hex Bolt", "sku": "HB-01", "category": "Fasteners", "quantity_on_hand": 50})
+    client.post("/products", json={"name": "Latex Paint", "sku": "LP-99", "category": "Coatings", "quantity_on_hand": 20})
+
+    # Link Hex Bolt (product 1) to Acme Hardware (supplier 1) via an IN transaction
+    client.post("/transactions", json={"product_id": 1, "supplier_id": 1, "type": "IN", "quantity": 10})
+
+    # Filter by partial name
+    by_name = client.get("/products?name=bolt").get_json()
+    assert len(by_name) == 1 and by_name[0]["sku"] == "HB-01"
+
+    # Filter by partial SKU
+    by_sku = client.get("/products?sku=LP-").get_json()
+    assert len(by_sku) == 1 and by_sku[0]["name"] == "Latex Paint"
+
+    # Filter by category
+    by_cat = client.get("/products?category=fasten").get_json()
+    assert len(by_cat) == 1 and by_cat[0]["sku"] == "HB-01"
+
+    # Filter by supplier name
+    by_sup = client.get("/products?supplier=acme").get_json()
+    assert len(by_sup) == 1 and by_sup[0]["sku"] == "HB-01"
+
+
+def test_reconcile_product_stock_requires_reason_and_logs_adjustment(client):
+    """Verify POST /products/<id>/reconcile updates stock, requires a reason, and logs net difference (R5, R20)."""
+    store.reconciliations = []
+    client.post("/products", json={"name": "Drill Bit", "sku": "DB-1", "quantity_on_hand": 30})
+
+    # Missing reason must be rejected with 400
+    missing_reason = client.post("/products/1/reconcile", json={"physical_count": 25, "reason": "   "})
+    assert missing_reason.status_code == 400
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 30
+
+    # Valid reconciliation overwrites stock and records net difference (-5)
+    valid_rec = client.post("/products/1/reconcile", json={
+        "physical_count": 25,
+        "reason": "Damaged units removed during cycle count"
+    })
+    assert valid_rec.status_code == 200
+    rec_data = valid_rec.get_json()
+    assert rec_data["previous_quantity"] == 30
+    assert rec_data["physical_count"] == 25
+    assert rec_data["net_difference"] == -5
+    assert rec_data["reason"] == "Damaged units removed during cycle count"
+
+    # Confirm product stock was updated and reconciliation appears in report list
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 25
+    history = client.get("/products/reconciliations").get_json()
+    assert len(history) == 1
+    assert history[0]["sku"] == "DB-1"
