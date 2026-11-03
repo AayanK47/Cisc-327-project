@@ -1,0 +1,88 @@
+# tests/test_partner.py
+ import pytest
+ from app import create_app, store
+ 
+ 
+@pytest.fixture
+ def client():
+ 	store.reset()
+ 	app = create_app()
+ 	app.config["TESTING"] = True
+ 	with app.test_client() as client:
+     	yield client
+ 
+ 
+# =====================================================================
+ # COMMIT 1: Supplier CRUD & Boundary/Error Cases
+ # =====================================================================
+ 
+def test_create_and_get_supplier_persists_data(client):
+ 	"""Verify POST /suppliers creates a supplier and GET /suppliers/<id> returns it (R22)."""
+ 	post_resp = client.post("/suppliers", json={
+     	"name": "Kingston Industrial Supply",
+     	"contact_email": "orders@kingstonsupply.ca"
+ 	})
+ 	assert post_resp.status_code == 201
+ 	supplier = post_resp.get_json()
+ 	assert supplier["id"] == 1
+ 	assert supplier["name"] == "Kingston Industrial Supply"
+ 	assert supplier["contact_email"] == "orders@kingstonsupply.ca"
+ 
+	get_resp = client.get("/suppliers/1")
+ 	assert get_resp.status_code == 200
+ 	assert get_resp.get_json() == supplier
+ 
+ 
+def test_list_update_and_delete_supplier(client):
+ 	"""Verify full lifecycle of listing, updating, and deleting a supplier."""
+ 	client.post("/suppliers", json={"name": "Alpha Corp", "contact_email": "a@alpha.com"})
+ 
+	# List suppliers
+ 	list_resp = client.get("/suppliers")
+ 	assert list_resp.status_code == 200
+ 	assert len(list_resp.get_json()) == 1
+ 
+	# Update supplier
+ 	put_resp = client.put("/suppliers/1", json={"contact_email": "new@alpha.com"})
+ 	assert put_resp.status_code == 200
+ 	assert put_resp.get_json()["name"] == "Alpha Corp"
+ 	assert put_resp.get_json()["contact_email"] == "new@alpha.com"
+ 
+	# Delete supplier
+ 	del_resp = client.delete("/suppliers/1")
+ 	assert del_resp.status_code == 204
+ 	assert client.get("/suppliers/1").status_code == 404
+ 
+ 
+def test_supplier_not_found_error_cases(client):
+ 	"""Verify 404 responses for nonexistent supplier IDs."""
+ 	assert client.get("/suppliers/999").status_code == 404
+ 	assert client.put("/suppliers/999", json={"name": "None"}).status_code == 404
+ 	assert client.delete("/suppliers/999").status_code == 404
+ 	assert client.get("/suppliers/999/products").status_code == 404
+
+# =====================================================================
+ # COMMIT 2: Supplier Products Relational Query
+ # =====================================================================
+ 
+def test_supplier_products_returns_only_products_with_in_transactions(client):
+ 	"""Verify GET /suppliers/<id>/products returns unique products received via IN transactions."""
+ 	client.post("/suppliers", json={"name": "Sup 1", "contact_email": "s1@test.com"})
+ 	client.post("/suppliers", json={"name": "Sup 2", "contact_email": "s2@test.com"})
+ 	client.post("/products", json={"name": "Bolt", "sku": "B-1", "quantity_on_hand": 10})
+ 	client.post("/products", json={"name": "Nut", "sku": "N-1", "quantity_on_hand": 10})
+ 
+	# Log IN transaction for Bolt from Sup 1
+ 	client.post("/transactions", json={"product_id": 1, "supplier_id": 1, "type": "IN", "quantity": 20})
+ 	# Log OUT transaction for Nut with Sup 1 (should not count as received from supplier)
+ 	client.post("/transactions", json={"product_id": 2, "supplier_id": 1, "type": "OUT", "quantity": 5})
+ 
+	resp = client.get("/suppliers/1/products")
+ 	assert resp.status_code == 200
+ 	products = resp.get_json()
+ 	assert len(products) == 1
+ 	assert products[0]["sku"] == "B-1"
+ 
+	# Sup 2 has no IN transactions
+ 	assert client.get("/suppliers/2/products").get_json() == []
+ 
