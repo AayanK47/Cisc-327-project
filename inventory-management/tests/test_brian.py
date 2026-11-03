@@ -171,4 +171,52 @@ def test_receive_purchase_order_increments_product_stock_level(client):
 
     # Expected: 10 initial + 15 received = 25. Observed in baseline: remains 10.
     stock_resp = client.get("/products/1/stock-level")
-    assert stock_resp.get_json()["quantity_on_hand"] == 25
+    assert stock_resp.get_json()["quantity_on_hand"] == 25 
+
+# =====================================================================
+# COMMIT 4: Functional Enhancement Tests (Overdraft Guard & PO Discrepancy)
+# =====================================================================
+
+def test_outbound_transaction_exceeding_stock_requires_confirmation(client):
+    """Verify OUT transaction > quantity_on_hand blocks with 400 unless confirm=True (R14)."""
+    client.post("/products", json={"name": "Sensor", "sku": "SN-1", "quantity_on_hand": 5})
+
+    # Unconfirmed overdraft is blocked and stock remains 5
+    unconfirmed = client.post("/transactions", json={"product_id": 1, "type": "OUT", "quantity": 8})
+    assert unconfirmed.status_code == 400
+    assert unconfirmed.get_json()["requires_confirmation"] is True
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 5
+
+    # Confirmed overdraft proceeds
+    confirmed = client.post("/transactions", json={
+        "product_id": 1, "type": "OUT", "quantity": 8, "confirm": True
+    })
+    assert confirmed.status_code == 201
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == -3
+
+
+def test_receive_po_discrepancy_requires_confirmation_and_records_notes(client):
+    """Verify receiving a PO with a different quantity requires confirmation and logs discrepancy (R3, R15)."""
+    client.post("/suppliers", json={"name": "Sup 1", "contact_email": "s1@test.com"})
+    client.post("/products", json={"name": "Bearing", "sku": "BR-1", "quantity_on_hand": 10})
+    client.post("/purchase-orders", json={"supplier_id": 1, "product_id": 1, "quantity_ordered": 20})
+
+    # Unconfirmed quantity discrepancy (12 instead of 20) returns 400 warning
+    warn_resp = client.put("/purchase-orders/1/receive", json={"received_quantity": 12})
+    assert warn_resp.status_code == 400
+    assert warn_resp.get_json()["requires_confirmation"] is True
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 10
+
+    # Confirmed discrepancy updates stock by actual received_quantity (+12 -> 22) and records note
+    ok_resp = client.put("/purchase-orders/1/receive", json={
+        "received_quantity": 12,
+        "confirm": True,
+        "status": "partially_received",
+        "discrepancy_note": "8 units backordered by supplier"
+    })
+    assert ok_resp.status_code == 200
+    po_data = ok_resp.get_json()
+    assert po_data["status"] == "partially_received"
+    assert po_data["received_quantity"] == 12
+    assert po_data["discrepancy_note"] == "8 units backordered by supplier"
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 22
