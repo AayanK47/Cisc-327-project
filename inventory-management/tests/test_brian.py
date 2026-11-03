@@ -86,3 +86,89 @@ def test_supplier_products_returns_only_products_with_in_transactions(client):
 	# Sup 2 has no IN transactions
  	assert client.get("/suppliers/2/products").get_json() == []
  
+# =====================================================================
+ # COMMIT 3: Purchase Orders & Receiving Workflow (Includes Defect Test)
+ # =====================================================================
+ 
+def test_create_and_get_purchase_order(client):
+ 	"""Verify POST /purchase-orders creates a pending PO and validates supplier/product IDs."""
+ 	client.post("/suppliers", json={"name": "Sup 1", "contact_email": "s1@test.com"})
+ 	client.post("/products", json={"name": "Motor", "sku": "M-1", "quantity_on_hand": 5})
+ 
+	po_resp = client.post("/purchase-orders", json={
+     	"supplier_id": 1,
+     	"product_id": 1,
+     	"quantity_ordered": 15
+ 	})
+ 	assert po_resp.status_code == 201
+ 	po = po_resp.get_json()
+ 	assert po["id"] == 1
+ 	assert po["status"] == "pending"
+ 	assert po["quantity_ordered"] == 15
+ 	assert po["received_date"] is None
+ 
+	# Verify GET /purchase-orders and GET /purchase-orders/1
+ 	assert len(client.get("/purchase-orders").get_json()) == 1
+ 	assert client.get("/purchase-orders/1").get_json() == po
+ 
+ 
+def test_purchase_order_creation_and_lookup_errors(client):
+ 	"""Verify 404 when creating PO with invalid supplier/product or fetching invalid PO."""
+ 	client.post("/suppliers", json={"name": "Sup 1", "contact_email": "s1@test.com"})
+ 	client.post("/products", json={"name": "Motor", "sku": "M-1", "quantity_on_hand": 5})
+ 
+	# Invalid supplier_id
+ 	assert client.post("/purchase-orders", json={
+     	"supplier_id": 999, "product_id": 1, "quantity_ordered": 10
+ 	}).status_code == 404
+ 
+	# Invalid product_id
+ 	assert client.post("/purchase-orders", json={
+     	"supplier_id": 1, "product_id": 999, "quantity_ordered": 10
+ 	}).status_code == 404
+ 
+	# Nonexistent PO
+ 	assert client.get("/purchase-orders/999").status_code == 404
+ 	assert client.put("/purchase-orders/999/receive").status_code == 404
+ 
+ 
+def test_receive_purchase_order_prevents_double_receiving(client):
+ 	"""Verify receiving a PO transitions status to received, creates an IN transaction, and blocks repeat receive."""
+ 	client.post("/suppliers", json={"name": "Sup 1", "contact_email": "s1@test.com"})
+ 	client.post("/products", json={"name": "Pump", "sku": "PMP-1", "quantity_on_hand": 10})
+ 	client.post("/purchase-orders", json={"supplier_id": 1, "product_id": 1, "quantity_ordered": 25})
+ 
+	# First receive succeeds
+ 	rec_resp = client.put("/purchase-orders/1/receive")
+ 	assert rec_resp.status_code == 200
+ 	rec_data = rec_resp.get_json()
+ 	assert rec_data["status"] == "received"
+ 	assert rec_data["received_date"] is not None
+ 
+	# Audit trail transaction was created
+ 	txs = client.get("/transactions?supplier_id=1").get_json()
+ 	assert len(txs) == 1
+ 	assert txs[0]["type"] == "IN"
+ 	assert txs[0]["quantity"] == 25
+ 
+	# Second receive attempt fails with 400 Bad Request
+ 	dup_resp = client.put("/purchase-orders/1/receive")
+ 	assert dup_resp.status_code == 400
+ 
+ 
+def test_receive_purchase_order_increments_product_stock_level(client):
+ 	"""
+ 	DEFECT TEST (Expected to FAIL on baseline app):
+ 	Verify receiving a purchase order increments the product's quantity_on_hand (R3).
+ 	Currently fails because app/routes/purchase_orders.py omits updating product.quantity_on_hand.
+ 	"""
+ 	client.post("/suppliers", json={"name": "Sup 1", "contact_email": "s1@test.com"})
+ 	client.post("/products", json={"name": "Gearbox", "sku": "GB-1", "quantity_on_hand": 10})
+ 	client.post("/purchase-orders", json={"supplier_id": 1, "product_id": 1, "quantity_ordered": 15})
+ 
+	client.put("/purchase-orders/1/receive")
+ 
+	# Expected: 10 initial + 15 received = 25. Observed in baseline: remains 10.
+ 	stock_resp = client.get("/products/1/stock-level")
+ 	assert stock_resp.get_json()["quantity_on_hand"] == 25
+
