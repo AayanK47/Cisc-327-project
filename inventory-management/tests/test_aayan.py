@@ -118,3 +118,60 @@ def test_low_stock_identifies_items_at_or_below_reorder_level(client):
     assert "B-1" in flagged_skus
     assert "E-1" in flagged_skus
     assert "A-1" not in flagged_skus
+
+
+# =====================================================================
+# Commit 3: Inventory Transactions, Chained Workflows & Defects
+# =====================================================================
+
+def test_inbound_and_outbound_transactions_update_stock_level(client):
+    """Chained workflow: create product -> log IN -> log OUT -> verify final stock level."""
+    client.post("/products", json={"name": "Cable", "sku": "CBL-1", "quantity_on_hand": 20, "reorder_level": 15})
+
+    # Log IN transaction (+10) -> stock becomes 30
+    in_resp = client.post("/transactions", json={"product_id": 1, "type": "IN", "quantity": 10})
+    assert in_resp.status_code == 201
+    assert in_resp.get_json()["type"] == "IN"
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 30
+
+    # Log OUT transaction (-18) -> stock becomes 12 (which also triggers low-stock <= 15)
+    out_resp = client.post("/transactions", json={"product_id": 1, "type": "OUT", "quantity": 18})
+    assert out_resp.status_code == 201
+    assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 12
+
+    # Confirm product now appears in low-stock endpoint
+    low_stock_ids = [p["id"] for p in client.get("/products/low-stock").get_json()]
+    assert 1 in low_stock_ids
+
+
+def test_transaction_validation_errors(client):
+    """Verify POST /transactions rejects nonexistent products and invalid transaction types."""
+    # Nonexistent product
+    resp_missing = client.post("/transactions", json={"product_id": 999, "type": "IN", "quantity": 5})
+    assert resp_missing.status_code == 404
+
+    # Invalid transaction type
+    client.post("/products", json={"name": "Valve", "sku": "V-1", "quantity_on_hand": 10})
+    resp_bad_type = client.post("/transactions", json={"product_id": 1, "type": "ADJUST", "quantity": 5})
+    assert resp_bad_type.status_code == 400
+
+
+def test_filter_transactions_by_product_id_returns_matching_records(client):
+    """
+    DEFECT TEST (Expected to FAIL on baseline app):
+    Verify GET /transactions?product_id=<id> filters by t.product_id (supports R21/R16).
+    Currently fails because app/routes/transactions.py checks `t.supplier_id == product_id`.
+    """
+    client.post("/products", json={"name": "Prod 1", "sku": "P-1", "quantity_on_hand": 10})
+    client.post("/products", json={"name": "Prod 2", "sku": "P-2", "quantity_on_hand": 10})
+
+    # Create transaction for product_id=1 with no supplier_id (supplier_id=None)
+    client.post("/transactions", json={"product_id": 1, "type": "IN", "quantity": 5})
+    # Create transaction for product_id=2
+    client.post("/transactions", json={"product_id": 2, "type": "OUT", "quantity": 3})
+
+    resp = client.get("/transactions?product_id=1")
+    assert resp.status_code == 200
+    results = resp.get_json()
+    assert len(results) == 1
+    assert results[0]["product_id"] == 1
