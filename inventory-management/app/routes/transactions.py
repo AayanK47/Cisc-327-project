@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify, request
 
 from app import store
 from app.models.transaction import Transaction
+from notification_service import LOW_STOCK_RECIPIENT, LOW_STOCK_SUBJECT, send_notification
 
 transactions_bp = Blueprint("transactions", __name__, url_prefix="/transactions")
 
@@ -30,6 +31,7 @@ def create_transaction():
         return jsonify({"error": "quantity must be a positive integer"}), 400
 
     tx_type = data["type"]
+    previous_quantity = product.quantity_on_hand
 
     if tx_type == "IN":
         product.quantity_on_hand += quantity
@@ -54,4 +56,21 @@ def create_transaction():
         quantity=quantity,
     )
     store.transactions[transaction_id] = transaction
-    return jsonify(transaction.to_dict()), 201
+    result = transaction.to_dict()
+    reorder_level = product.reorder_level
+
+    if (
+        tx_type == "OUT"
+        and isinstance(reorder_level, (int, float))
+        and previous_quantity >= reorder_level > product.quantity_on_hand
+    ):
+        message = (
+            f"{product.name} inventory has dropped to "
+            f"{product.quantity_on_hand} units. "
+            f"The minimum threshold is {reorder_level} units."
+        )
+        result["notification_sent"] = send_notification(
+            LOW_STOCK_RECIPIENT, LOW_STOCK_SUBJECT, message
+        )
+
+    return jsonify(result), 201
