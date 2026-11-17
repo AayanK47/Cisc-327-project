@@ -1,5 +1,6 @@
 """Assignment 3 coverage-directed tests for Brian (Member B)."""
 
+from unittest.mock import patch
 import pytest
 
 from app import store
@@ -153,3 +154,90 @@ def test_transaction_rejects_non_positive_or_non_integer_quantity(client, quanti
     assert response.get_json() == {"error": "quantity must be a positive integer"}
     assert client.get("/products/1/stock-level").get_json()["quantity_on_hand"] == 10
     assert client.get("/transactions").get_json() == []
+
+
+def test_failed_low_stock_notification_still_saves_transaction(
+    client, monkeypatch
+):
+    product_response = client.post(
+        "/products",
+        json={
+            "name": "Keyboard",
+            "sku": "KB-1",
+            "quantity_on_hand": 10,
+            "reorder_level": 10,
+        },
+    )
+    assert product_response.status_code == 201
+    product_id = product_response.get_json()["id"]
+
+    # Stub notification service to simulate failure
+    monkeypatch.setattr(
+        "app.routes.transactions.send_notification",
+        lambda recipient, subject, message: False,
+    )
+
+    response = client.post(
+        "/transactions",
+        json={
+            "product_id": product_id,
+            "type": "OUT",
+            "quantity": 7,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.get_json()["notification_sent"] is False
+
+    # Stock still decreases
+    stock = client.get(
+        f"/products/{product_id}/stock-level"
+    ).get_json()
+    assert stock["quantity_on_hand"] == 3
+
+    # Transaction is still saved
+    transactions = client.get("/transactions").get_json()
+    assert len(transactions) == 1
+    assert transactions[0]["quantity"] == 7
+    assert transactions[0]["type"] == "OUT" 
+
+
+def test_low_stock_notification_not_triggered_at_threshold(client):
+    product_response = client.post(
+        "/products",
+        json={
+            "name": "Mouse",
+            "sku": "MS-1",
+            "quantity_on_hand": 12,
+            "reorder_level": 10,
+        },
+    )
+    assert product_response.status_code == 201
+    product_id = product_response.get_json()["id"]
+
+    # Remove 2 units, leaving exactly 10
+    with patch(
+        "app.routes.transactions.send_notification"
+    ) as mock_send:
+        response = client.post(
+            "/transactions",
+            json={
+                "product_id": product_id,
+                "type": "OUT",
+                "quantity": 2,
+            },
+        )
+
+    assert response.status_code == 201
+    mock_send.assert_not_called()
+
+    # Verify stock and transaction
+    stock = client.get(
+        f"/products/{product_id}/stock-level"
+    ).get_json()
+    assert stock["quantity_on_hand"] == 10
+
+    transactions = client.get("/transactions").get_json()
+    assert len(transactions) == 1
+    assert transactions[0]["quantity"] == 2
+    assert transactions[0]["type"] == "OUT"
